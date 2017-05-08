@@ -495,6 +495,7 @@ func (n *node) doSendMessage(to uint64, data []byte) {
 		return
 	case err := <-ch:
 		if grpc.ErrorDesc(err) == errorNodeIDBanned.Error() {
+			groups().syncMemberships()
 			groups().removeNode(n.gid, *raftId)
 		}
 		// We don't need to do anything if we receive any error while sending message.
