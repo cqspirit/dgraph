@@ -680,9 +680,13 @@ func (g *groupi) applyMembershipUpdate(raftIdx uint64, mm *taskp.Membership) {
 		for _, s := range g.all {
 			s.remove(update.NodeId)
 		}
+		for _, s := range g.removed {
+			s.remove(update.NodeId)
+		}
 	} else if mm.Removed {
 		g.removeId(mm.GroupId, update)
 	} else {
+		g.clearRemoveId(mm.GroupId, update)
 		// Append update to the list. If it's a leader, move it to index zero.
 		sl.list = append(sl.list, update)
 		last := len(sl.list) - 1
@@ -796,11 +800,10 @@ func (w *grpcWorker) UpdateMembership(ctx context.Context,
 			RedirectAddr: addr,
 		}, nil
 	}
-
 	che := make(chan error, len(update.Members))
 	for _, mm := range update.Members {
-		if groups().isDuplicate(mm.GroupId, mm.Id, mm.Addr, mm.Leader) ||
-			(!mm.ClearRemoved && groups().reject(mm.GroupId, mm.Id)) {
+		if !mm.ClearRemoved && ((groups().isDuplicate(mm.GroupId, mm.Id, mm.Addr,
+			mm.Leader) && !mm.Banned && !mm.Removed) || groups().reject(mm.GroupId, mm.Id)) {
 			che <- nil
 			continue
 		}

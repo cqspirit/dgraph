@@ -46,9 +46,14 @@ const (
 	proposalMutation   = 0
 	proposalReindex    = 1
 	proposalMembership = 2
-	addGroups          = "ADD_GROUPS"
-	removeGroups       = "REMOVE_GROUPS"
-	removeServer       = "REMOVE_SERVER"
+)
+
+type clusterOp int
+
+const (
+	ADD_GROUPS    clusterOp = 1
+	REMOVE_GROUPS clusterOp = 2
+	REMOVE_SERVER clusterOp = 3
 )
 
 var (
@@ -110,17 +115,26 @@ type sendmsg struct {
 	data []byte
 }
 
-type MembershipChanges struct {
-	Id   uint64
-	Gids []uint32
-	Op   string
+type ClusterConfChanges struct {
+	Id    uint64
+	Gids  []uint32
+	Op    clusterOp
+	OpStr string
 }
 
-func (mc *MembershipChanges) Valid() bool {
-	if mc.Op == addGroups || mc.Op == removeGroups {
-		return len(mc.Gids) > 0
+func (cc *ClusterConfChanges) Valid() bool {
+	switch cc.OpStr {
+	case "ADD_GROUPS":
+		cc.Op = ADD_GROUPS
+	case "REMOVE_GROUPS":
+		cc.Op = REMOVE_GROUPS
+	case "REMOVE_SERVER":
+		cc.Op = REMOVE_SERVER
 	}
-	return mc.Op == removeServer
+	if cc.Op == ADD_GROUPS || cc.Op == REMOVE_GROUPS {
+		return len(cc.Gids) > 0
+	}
+	return cc.Op == REMOVE_SERVER
 }
 
 type node struct {
@@ -375,7 +389,7 @@ func (n *node) ProposeAndWait(ctx context.Context, proposal *taskp.Proposal) err
 	} else if proposal.Membership != nil {
 		proposalData[0] = proposalMembership
 	} else {
-		x.Fatalf("Unkonw proposal")
+		x.Fatalf("Unknown proposal")
 	}
 	copy(proposalData[1:], slice)
 
@@ -903,7 +917,11 @@ func (n *node) joinPeers() {
 
 	c := workerp.NewWorkerClient(conn)
 	x.Printf("Calling JoinCluster")
-	_, err = c.JoinCluster(n.ctx, n.raftContext)
+	cc := &workerp.ClusterConfChange{
+		Context: n.raftContext,
+		Op:      workerp.ClusterConfChange_JOIN,
+	}
+	_, err = c.ManageCluster(n.ctx, cc)
 	x.Checkf(err, "Error while joining cluster")
 	x.Printf("Done with JoinCluster call\n")
 }
@@ -1114,47 +1132,28 @@ func stopGroup(ctx context.Context, gid uint32, nodeId uint64) error {
 	return nil
 }
 
-func manageCluster(ctx context.Context, mc *workerp.MembershipChange) error {
-	switch mc.Op {
-	case workerp.MembershipChange_ADD:
-		x.AssertTrue(mc.Id == *raftId)
-		return startGroup(mc.Group)
-	case workerp.MembershipChange_REMOVE:
-		return stopGroup(ctx, mc.Group, mc.Id)
+func manageCluster(ctx context.Context, cc *workerp.ClusterConfChange) error {
+	switch cc.Op {
+	case workerp.ClusterConfChange_ADD:
+		x.AssertTrue(cc.Context.Id == *raftId)
+		return startGroup(cc.Context.Group)
+	case workerp.ClusterConfChange_REMOVE:
+		return stopGroup(ctx, cc.Context.Group, cc.Context.Id)
+	case workerp.ClusterConfChange_JOIN:
+		return joinCluster(ctx, cc.Context)
 	default:
-		x.Fatalf("Unknown membership change Op")
+		x.Fatalf("Unknown cluster conf change Operation")
+		return nil
 	}
-	x.Fatalf("Shouldn't reach here")
-	return nil
 }
 
-func (w *grpcWorker) ManageCluster(ctx context.Context, mc *workerp.MembershipChange) (*workerp.Payload, error) {
+func (w *grpcWorker) ManageCluster(ctx context.Context, cc *workerp.ClusterConfChange) (*workerp.Payload, error) {
 	if ctx.Err() != nil {
 		return &workerp.Payload{}, ctx.Err()
 	}
-
-	err := manageCluster(ctx, mc)
-	return &workerp.Payload{}, err
-}
-
-func (w *grpcWorker) JoinCluster(ctx context.Context, rc *taskp.RaftContext) (*workerp.Payload, error) {
-	if ctx.Err() != nil {
-		return &workerp.Payload{}, ctx.Err()
-	}
-
-	s, found := groups().Server(rc.Id, rc.Group)
-	if rc.Id == *raftId || (s.Addr == rc.Addr && found) {
-		return &workerp.Payload{}, errorNodeIDExists
-	}
-
-	node := groups().Node(rc.Group)
-	if node == nil {
-		return &workerp.Payload{}, nil
-	}
-	node.Connect(rc.Id, rc.Addr)
 
 	c := make(chan error, 1)
-	go func() { c <- node.AddToCluster(ctx, rc.Id) }()
+	go func() { c <- manageCluster(ctx, cc) }()
 
 	select {
 	case <-ctx.Done():
@@ -1164,28 +1163,45 @@ func (w *grpcWorker) JoinCluster(ctx context.Context, rc *taskp.RaftContext) (*w
 	}
 }
 
-func canServeLocally(gid uint32, nodeId uint64, op string) bool {
+func joinCluster(ctx context.Context, rc *taskp.RaftContext) error {
+	s, found := groups().Server(rc.Id, rc.Group)
+	if rc.Id == *raftId || (s.Addr == rc.Addr && found) {
+		return errorNodeIDExists
+	}
+
+	node := groups().Node(rc.Group)
+	if node == nil {
+		return nil
+	}
+	node.Connect(rc.Id, rc.Addr)
+
+	err := node.AddToCluster(ctx, rc.Id)
+	return err
+}
+
+func canServeLocally(gid uint32, nodeId uint64, op clusterOp) bool {
 	switch op {
-	case addGroups:
+	case ADD_GROUPS:
 		return nodeId == *raftId
 	default:
 		return groups().ServesGroup(gid)
 	}
 }
 
-func toMembershipChange(gid uint32, nodeId uint64, op string) *workerp.MembershipChange {
-	mc := &workerp.MembershipChange{Id: nodeId, Group: gid}
-	if op == addGroups {
-		mc.Op = workerp.MembershipChange_ADD
-	} else if op == removeGroups || op == removeServer {
-		mc.Op = workerp.MembershipChange_REMOVE
+func toMembershipChange(gid uint32, nodeId uint64, op clusterOp) *workerp.ClusterConfChange {
+	rc := &taskp.RaftContext{Id: nodeId, Group: gid}
+	cc := &workerp.ClusterConfChange{Context: rc}
+	if op == ADD_GROUPS {
+		cc.Op = workerp.ClusterConfChange_ADD
+	} else if op == REMOVE_GROUPS || op == REMOVE_SERVER {
+		cc.Op = workerp.ClusterConfChange_REMOVE
 	} else {
 		x.Fatalf("Unknown membership change")
 	}
-	return mc
+	return cc
 }
 
-func manageClusterOverNetwork(ctx context.Context, gid uint32, nodeId uint64, op string) error {
+func manageClusterOverNetwork(ctx context.Context, gid uint32, nodeId uint64, op clusterOp) error {
 	mc := toMembershipChange(gid, nodeId, op)
 	if canServeLocally(gid, nodeId, op) {
 		if err := manageCluster(ctx, mc); err != nil {
@@ -1196,7 +1212,7 @@ func manageClusterOverNetwork(ctx context.Context, gid uint32, nodeId uint64, op
 
 	var paddr string
 	var pid uint64
-	if op == addGroups {
+	if op == ADD_GROUPS {
 		paddr = groups().address(nodeId)
 		if len(paddr) == 0 {
 			return x.Errorf("Node with id %d not found", nodeId)
@@ -1228,8 +1244,8 @@ func manageClusterOverNetwork(ctx context.Context, gid uint32, nodeId uint64, op
 	return nil
 }
 
-func ManageClusterOverNetwork(mc MembershipChanges) error {
-	if mc.Op == removeServer {
+func ManageClusterOverNetwork(mc ClusterConfChanges) error {
+	if mc.Op == REMOVE_SERVER {
 		if len(mc.Gids) == 0 {
 			mc.Gids = groups().groupsServed(mc.Id)
 		}
@@ -1238,7 +1254,7 @@ func ManageClusterOverNetwork(mc MembershipChanges) error {
 
 	addr := groups().address(mc.Id)
 	for _, gid := range mc.Gids {
-		if mc.Op == addGroups {
+		if mc.Op == ADD_GROUPS {
 			if len(addr) == 0 {
 				return x.Errorf(
 					"Node with id %d not found, please retry the request on node %d",
@@ -1248,7 +1264,7 @@ func ManageClusterOverNetwork(mc MembershipChanges) error {
 				return x.Errorf("Node %d is already serving group %d", mc.Id, gid)
 			}
 			groups().syncClearRemovedId(gid, mc.Id)
-		} else if mc.Op == removeGroups {
+		} else if mc.Op == REMOVE_GROUPS {
 			if _, found := groups().Server(mc.Id, gid); !found {
 				return x.Errorf("node %d not serving group %d", mc.Id, gid)
 			}

@@ -452,7 +452,7 @@ func clusterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var mc worker.MembershipChanges
+	var mc worker.ClusterConfChanges
 	if err = json.Unmarshal(req, &mc); err != nil || !mc.Valid() {
 		x.TraceError(ctx, x.Wrapf(err, "Error while unmarshalling cluster request"))
 		x.SetStatus(w, x.ErrorInvalidRequest, "Invalid request encountered.")
